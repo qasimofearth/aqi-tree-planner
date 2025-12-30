@@ -12,11 +12,18 @@ const App = {
         stationData: null,
         windData: null,
         simulationResults: null,
-        isLoading: false
+        isLoading: false,
+        isDrawingLine: false,
+        linePoints: [],
+        treeSpacing: 15 // meters between trees on line
     },
 
     // Chart instance
     speciesChart: null,
+
+    // Line drawing layer
+    drawingLayer: null,
+    previewLine: null,
 
     /**
      * Initialize the application
@@ -94,6 +101,17 @@ const App = {
         document.getElementById('btn-simulate')?.addEventListener('click', () => this.runSimulation());
         document.getElementById('btn-compare')?.addEventListener('click', () => this.showComparison());
         document.getElementById('btn-generate-report')?.addEventListener('click', () => this.generateReport());
+
+        // Line drawing
+        document.getElementById('btn-draw-line')?.addEventListener('click', () => this.toggleLineDrawing());
+        document.getElementById('btn-cancel-draw')?.addEventListener('click', () => this.cancelLineDrawing());
+
+        // Save/Load
+        document.getElementById('btn-save-project')?.addEventListener('click', () => this.saveProject());
+        document.getElementById('btn-load-project')?.addEventListener('click', () => {
+            document.getElementById('file-input')?.click();
+        });
+        document.getElementById('file-input')?.addEventListener('change', (e) => this.loadProject(e));
 
         // Modal close buttons
         document.getElementById('modal-close')?.addEventListener('click', () => {
@@ -338,6 +356,66 @@ const App = {
         if (document.getElementById('layer-coverage')?.checked) {
             MapManager.showCoverageZones(true);
         }
+
+        // Update timeline
+        this.updateTimeline(speciesCount);
+
+        // Update health impact
+        this.updateHealthImpact(totalReduction);
+    },
+
+    /**
+     * Update growth timeline display
+     */
+    updateTimeline(speciesCount) {
+        const treeData = Object.entries(speciesCount).map(([speciesId, count]) => ({
+            speciesId,
+            count
+        }));
+
+        const timeline = TreeSpecies.calculateTimelineImpact(treeData, this.state.season);
+
+        // Update Year 1
+        document.getElementById('timeline-pm25-1').textContent = timeline.year1.pm25Reduction;
+        document.getElementById('timeline-coverage-1').textContent = `${timeline.year1.coverage} km²`;
+
+        // Update Year 5
+        document.getElementById('timeline-pm25-5').textContent = timeline.year5.pm25Reduction;
+        document.getElementById('timeline-coverage-5').textContent = `${timeline.year5.coverage} km²`;
+
+        // Update Year 10
+        document.getElementById('timeline-pm25-10').textContent = timeline.year10.pm25Reduction;
+        document.getElementById('timeline-coverage-10').textContent = `${timeline.year10.coverage} km²`;
+
+        // Update Year 20
+        document.getElementById('timeline-pm25-20').textContent = timeline.year20.pm25Reduction;
+        document.getElementById('timeline-coverage-20').textContent = `${timeline.year20.coverage} km²`;
+    },
+
+    /**
+     * Update health impact display
+     */
+    updateHealthImpact(pm25Reduction) {
+        // Estimate affected population based on coverage
+        const trees = MapManager.placedTrees;
+        let totalCoverage = 0;
+        trees.forEach(tree => {
+            const species = TreeSpecies.getById(tree.speciesId);
+            if (species) {
+                totalCoverage += species.canopyArea;
+            }
+        });
+
+        // Population density (per km²)
+        const density = this.state.city === 'lahore' ? 6300 : 11320;
+        const coverageKm2 = totalCoverage / 1000000;
+        const population = Math.round(coverageKm2 * density * 2); // x2 for surrounding area
+
+        const health = TreeSpecies.calculateHealthImpact(pm25Reduction, population);
+
+        document.getElementById('health-lives').textContent = health.livesSavedPerYear;
+        document.getElementById('health-hosp').textContent = health.respiratoryHospPrevented;
+        document.getElementById('health-economic').textContent = `$${(health.economicValueUSD / 1000000).toFixed(1)}M`;
     },
 
     /**
@@ -555,6 +633,247 @@ const App = {
         a.download = `tree_placements_${this.state.city}_${new Date().toISOString().split('T')[0]}.geojson`;
         a.click();
         URL.revokeObjectURL(url);
+    },
+
+    /**
+     * Toggle line drawing mode
+     */
+    toggleLineDrawing() {
+        if (!this.state.selectedSpecies) {
+            MapManager.showToast('Please select a tree species first');
+            return;
+        }
+
+        this.state.isDrawingLine = !this.state.isDrawingLine;
+
+        const btn = document.getElementById('btn-draw-line');
+        const indicator = document.getElementById('drawing-mode-indicator');
+
+        if (this.state.isDrawingLine) {
+            btn.classList.add('active');
+            indicator.style.display = 'flex';
+            this.state.linePoints = [];
+
+            // Initialize drawing layer
+            if (!this.drawingLayer) {
+                this.drawingLayer = L.layerGroup().addTo(MapManager.map);
+            }
+
+            // Change cursor
+            MapManager.map.getContainer().style.cursor = 'crosshair';
+
+            // Add click handler for line drawing
+            MapManager.map.on('click', this.handleLineClick.bind(this));
+            MapManager.map.on('dblclick', this.finishLineDrawing.bind(this));
+
+            MapManager.showToast('Click to add points. Double-click to finish.');
+        } else {
+            this.cancelLineDrawing();
+        }
+    },
+
+    /**
+     * Handle click during line drawing
+     */
+    handleLineClick(e) {
+        if (!this.state.isDrawingLine) return;
+
+        const point = [e.latlng.lat, e.latlng.lng];
+        this.state.linePoints.push(point);
+
+        // Add marker for the point
+        const marker = L.circleMarker(e.latlng, {
+            radius: 6,
+            color: '#1976d2',
+            fillColor: '#1976d2',
+            fillOpacity: 1
+        }).addTo(this.drawingLayer);
+
+        // Update preview line
+        if (this.state.linePoints.length > 1) {
+            if (this.previewLine) {
+                this.drawingLayer.removeLayer(this.previewLine);
+            }
+            this.previewLine = L.polyline(this.state.linePoints, {
+                color: '#1976d2',
+                weight: 3,
+                dashArray: '10, 5'
+            }).addTo(this.drawingLayer);
+        }
+    },
+
+    /**
+     * Finish line drawing and place trees
+     */
+    finishLineDrawing(e) {
+        if (!this.state.isDrawingLine || this.state.linePoints.length < 2) {
+            this.cancelLineDrawing();
+            return;
+        }
+
+        // Prevent the double-click from being treated as a point
+        L.DomEvent.stopPropagation(e);
+
+        // Calculate trees along the line
+        const trees = this.calculateTreesAlongLine(this.state.linePoints, this.state.treeSpacing);
+
+        // Place the trees
+        trees.forEach(point => {
+            MapManager.placeTree(point.lat, point.lng, this.state.selectedSpecies);
+        });
+
+        MapManager.showToast(`Placed ${trees.length} trees along the road`);
+
+        // Clean up
+        this.cancelLineDrawing();
+    },
+
+    /**
+     * Calculate tree positions along a line
+     */
+    calculateTreesAlongLine(points, spacing) {
+        const trees = [];
+        const metersPerDegLat = 111320;
+
+        for (let i = 0; i < points.length - 1; i++) {
+            const start = points[i];
+            const end = points[i + 1];
+
+            // Calculate segment length in meters
+            const dLat = (end[0] - start[0]) * metersPerDegLat;
+            const dLng = (end[1] - start[1]) * metersPerDegLat * Math.cos(start[0] * Math.PI / 180);
+            const segmentLength = Math.sqrt(dLat * dLat + dLng * dLng);
+
+            // Number of trees on this segment
+            const numTrees = Math.floor(segmentLength / spacing);
+
+            for (let j = 0; j <= numTrees; j++) {
+                const ratio = j / Math.max(numTrees, 1);
+                trees.push({
+                    lat: start[0] + (end[0] - start[0]) * ratio,
+                    lng: start[1] + (end[1] - start[1]) * ratio
+                });
+            }
+        }
+
+        return trees;
+    },
+
+    /**
+     * Cancel line drawing mode
+     */
+    cancelLineDrawing() {
+        this.state.isDrawingLine = false;
+        this.state.linePoints = [];
+
+        const btn = document.getElementById('btn-draw-line');
+        const indicator = document.getElementById('drawing-mode-indicator');
+
+        btn?.classList.remove('active');
+        if (indicator) indicator.style.display = 'none';
+
+        // Clear drawing layer
+        if (this.drawingLayer) {
+            this.drawingLayer.clearLayers();
+        }
+
+        // Reset cursor
+        MapManager.map.getContainer().style.cursor = '';
+
+        // Remove event handlers
+        MapManager.map.off('click', this.handleLineClick.bind(this));
+        MapManager.map.off('dblclick', this.finishLineDrawing.bind(this));
+    },
+
+    /**
+     * Save project to JSON file
+     */
+    saveProject() {
+        const trees = MapManager.placedTrees;
+
+        if (trees.length === 0) {
+            MapManager.showToast('No trees to save');
+            return;
+        }
+
+        const project = {
+            version: '1.0',
+            savedAt: new Date().toISOString(),
+            city: this.state.city,
+            season: this.state.season,
+            trees: trees.map(t => ({
+                lat: t.lat,
+                lng: t.lng,
+                speciesId: t.speciesId
+            }))
+        };
+
+        const blob = new Blob([JSON.stringify(project, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `aqi_tree_project_${this.state.city}_${new Date().toISOString().split('T')[0]}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+
+        MapManager.showToast('Project saved successfully');
+    },
+
+    /**
+     * Load project from JSON file
+     */
+    loadProject(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            try {
+                const project = JSON.parse(e.target.result);
+
+                if (!project.trees || !Array.isArray(project.trees)) {
+                    throw new Error('Invalid project file');
+                }
+
+                // Confirm if current trees exist
+                if (MapManager.placedTrees.length > 0) {
+                    if (!confirm('This will replace current trees. Continue?')) {
+                        return;
+                    }
+                }
+
+                // Clear existing trees
+                MapManager.clearAllTrees();
+
+                // Switch city if needed
+                if (project.city && project.city !== this.state.city) {
+                    this.switchCity(project.city);
+                }
+
+                // Set season
+                if (project.season) {
+                    this.state.season = project.season;
+                    document.getElementById('season-select').value = project.season;
+                }
+
+                // Place trees
+                project.trees.forEach(t => {
+                    MapManager.placeTree(t.lat, t.lng, t.speciesId);
+                });
+
+                MapManager.showToast(`Loaded ${project.trees.length} trees`);
+                MapManager.fitToTrees();
+
+            } catch (error) {
+                console.error('Error loading project:', error);
+                MapManager.showToast('Failed to load project file');
+            }
+        };
+
+        reader.readAsText(file);
+
+        // Reset file input
+        event.target.value = '';
     }
 };
 
